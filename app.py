@@ -5,6 +5,7 @@ Accesibilidad motora: el usuario escribe una instrucción y obtiene un MIDI simp
 
 import io
 import json
+import math
 import os
 import re
 import struct
@@ -13,6 +14,8 @@ from urllib.parse import urlparse
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
+from audio_recorder_streamlit import audio_recorder
 from dotenv import load_dotenv
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -32,6 +35,10 @@ MODEL_NAME       = os.getenv("MODEL_NAME", "") or MODEL_DEPLOYMENT
 # Para endpoints clásicos *.openai.azure.com usar 2024-10-21
 FOUNDRY_API_VERSION = os.getenv("FOUNDRY_API_VERSION", "2024-05-01-preview")
 
+# Azure Speech (Speech-to-Text)
+SPEECH_KEY    = os.getenv("SPEECH_KEY", "")
+SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "").strip('"')
+
 # Campos mínimos que el JSON del modelo debe contener
 REQUIRED_FIELDS = {"title", "tempo_bpm", "key", "length_bars",
                    "time_signature", "melody"}
@@ -41,7 +48,140 @@ PITCH_MIN = 48
 PITCH_MAX = 72
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. PROMPT DEL SISTEMA
+# 2a. HELPERS DE AUDIO
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _wav_duration(wav_bytes: bytes) -> float:
+    """
+    Extrae la duración en segundos de un buffer WAV/PCM.
+    """
+    try:
+        if len(wav_bytes) < 44:
+            return 0.0
+        channels    = struct.unpack_from("<H", wav_bytes, 22)[0]
+        sample_rate = struct.unpack_from("<I", wav_bytes, 24)[0]
+        bits        = struct.unpack_from("<H", wav_bytes, 34)[0]
+        pcm         = wav_bytes[44:]
+        n_samples   = len(pcm) // (bits // 8)
+        duration    = n_samples / (sample_rate * channels) if sample_rate else 0
+        return round(duration, 1)
+    except Exception:
+        return 0.0
+
+
+# Timer JS que observa el botón del audio_recorder y muestra cronómetro en vivo
+_RECORDING_TIMER_HTML = """
+<div id="rec-timer-root" style="text-align:center;padding:6px 0;font-family:sans-serif;">
+  <div style="font-size:13px;color:#888;">⏱ Tiempo de grabación</div>
+  <div id="rec-display" style="font-size:28px;font-weight:bold;color:#ccc;margin-top:2px;">0:00.0</div>
+</div>
+<script>
+(function(){
+  const display = document.getElementById('rec-display');
+  let recording = false, startT = 0, interval = null, finalTime = '0:00.0';
+
+  function fmt(ms){
+    const totalSec = ms / 1000;
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec - m * 60;
+    return m + ':' + s.toFixed(1).padStart(4,'0');
+  }
+
+  function tick(){
+    display.textContent = fmt(Date.now() - startT);
+  }
+
+  function startTimer(){
+    recording = true;
+    startT = Date.now();
+    display.style.color = '#e74c3c';
+    display.textContent = '0:00.0';
+    interval = setInterval(tick, 100);
+  }
+
+  function stopTimer(){
+    recording = false;
+    if(interval){ clearInterval(interval); interval = null; }
+    finalTime = fmt(Date.now() - startT);
+    display.textContent = finalTime;
+    display.style.color = '#2ecc71';
+  }
+
+  /* Observa clics en el botón del audio_recorder (iframe padre) */
+  function poll(){
+    try {
+      const btns = window.parent.document.querySelectorAll('button[kind="mic"], .audio-recorder-btn, iframe');
+      /* audio_recorder usa un iframe; buscamos su contenedor */
+      const iframes = window.parent.document.querySelectorAll('iframe');
+      for(const ifr of iframes){
+        try {
+          const doc = ifr.contentDocument || ifr.contentWindow.document;
+          const recBtn = doc.querySelector('button, [role="button"]');
+          if(!recBtn || recBtn._timerBound) continue;
+          recBtn._timerBound = true;
+          recBtn.addEventListener('click', ()=>{
+            if(!recording) startTimer(); else stopTimer();
+          });
+        } catch(e){}
+      }
+    } catch(e){}
+  }
+
+  /* MutationObserver para detectar cuando el iframe del recorder aparece */
+  const obs = new MutationObserver(poll);
+  obs.observe(window.parent.document.body, {childList:true, subtree:true});
+  poll();
+})();
+</script>
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2b. TRANSCRIPCIÓN DE VOZ (Azure Speech-to-Text REST API)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def transcribe_audio(audio_bytes: bytes, language: str = "es-CR") -> str:
+    """
+    Envía audio WAV a Azure Speech-to-Text REST API y devuelve el texto.
+    Lanza RuntimeError si la transcripción falla.
+    """
+    if not SPEECH_KEY or not SPEECH_REGION:
+        raise RuntimeError(
+            "Variables SPEECH_KEY o AZURE_SPEECH_REGION no están configuradas."
+        )
+
+    url = (
+        f"https://{SPEECH_REGION}.stt.speech.microsoft.com"
+        f"/speech/recognition/conversation/cognitiveservices/v1"
+        f"?language={language}&format=detailed"
+    )
+    headers = {
+        "Ocp-Apim-Subscription-Key": SPEECH_KEY,
+        "Content-Type": "audio/wav; codecs=audio/pcm; samplerate=48000",
+        "Accept": "application/json",
+    }
+    try:
+        resp = requests.post(url, headers=headers, data=audio_bytes, timeout=30)
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError:
+        raise RuntimeError(
+            f"Error HTTP {resp.status_code} de Speech API: {resp.text[:400]}"
+        )
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Error de conexión con Speech API: {e}")
+
+    result = resp.json()
+    status = result.get("RecognitionStatus", "")
+    if status != "Success":
+        raise RuntimeError(
+            f"No se pudo transcribir el audio (status={status}). "
+            "Intenta hablar más claro o más cerca del micrófono."
+        )
+    return result.get("DisplayText", "").strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2b. PROMPT DEL SISTEMA
 # ─────────────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """
@@ -269,6 +409,88 @@ def build_midi(music_json: dict) -> bytes:
     return header + chunk
 
 
+def synthesize_wav(music_json: dict, sample_rate: int = 44100) -> bytes:
+    """
+    Sintetiza el JSON musical a un buffer WAV (16-bit PCM mono)
+    usando ondas sinusoidales con envolvente ADSR simple.
+    """
+    bpm   = max(40, min(200, int(music_json.get("tempo_bpm", 90))))
+    spb   = 60.0 / bpm  # segundos por beat
+    notes = music_json.get("melody", [])
+
+    # Calcular duración total en muestras
+    max_end = 0.0
+    for n in notes:
+        end = (float(n["start_beat"]) + float(n["duration_beats"])) * spb
+        if end > max_end:
+            max_end = end
+    total_samples = int((max_end + 0.3) * sample_rate)  # +0.3s de cola
+    buf = [0.0] * total_samples
+
+    for n in notes:
+        try:
+            midi_note = pitch_to_midi(str(n["pitch"]))
+        except ValueError:
+            continue
+        freq = 440.0 * (2.0 ** ((midi_note - 69) / 12.0))
+        vel  = max(0, min(127, int(n.get("velocity", 80)))) / 127.0
+        t0   = float(n["start_beat"]) * spb
+        dur  = float(n["duration_beats"]) * spb
+        s0   = int(t0 * sample_rate)
+        ns   = int(dur * sample_rate)
+        if s0 + ns > total_samples:
+            ns = total_samples - s0
+
+        # Envolvente ADSR simple (attack 20ms, decay 40ms, sustain 0.6, release 60ms)
+        att = int(0.02 * sample_rate)
+        dec = int(0.04 * sample_rate)
+        rel = int(0.06 * sample_rate)
+        sus_level = 0.6
+
+        for i in range(ns):
+            # Envolvente
+            if i < att:
+                env = i / att if att > 0 else 1.0
+            elif i < att + dec:
+                env = 1.0 - (1.0 - sus_level) * ((i - att) / dec) if dec > 0 else sus_level
+            elif i < ns - rel:
+                env = sus_level
+            else:
+                remaining = ns - i
+                env = sus_level * (remaining / rel) if rel > 0 else 0.0
+
+            t = i / sample_rate
+            # Onda con un leve armónico para dar cuerpo
+            sample = (math.sin(2 * math.pi * freq * t)
+                      + 0.3 * math.sin(4 * math.pi * freq * t)
+                      + 0.1 * math.sin(6 * math.pi * freq * t))
+            idx = s0 + i
+            if 0 <= idx < total_samples:
+                buf[idx] += sample * vel * env * 0.35
+
+    # Normalizar y convertir a 16-bit PCM
+    peak = max(abs(s) for s in buf) if buf else 1.0
+    if peak < 1e-6:
+        peak = 1.0
+    scale = 32000.0 / peak
+    pcm = struct.pack(f"<{len(buf)}h",
+                      *[max(-32768, min(32767, int(s * scale))) for s in buf])
+
+    # Construir WAV
+    data_size  = len(pcm)
+    byte_rate  = sample_rate * 2  # 16-bit mono
+    wav = io.BytesIO()
+    wav.write(b"RIFF")
+    wav.write(struct.pack("<I", 36 + data_size))
+    wav.write(b"WAVE")
+    wav.write(b"fmt ")
+    wav.write(struct.pack("<IHHIIHH", 16, 1, 1, sample_rate, byte_rate, 2, 16))
+    wav.write(b"data")
+    wav.write(struct.pack("<I", data_size))
+    wav.write(pcm)
+    return wav.getvalue()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. INTERFAZ STREAMLIT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -290,21 +512,76 @@ if _missing_env:
 
 # ── Entrada ───────────────────────────────────────────────────────────────────
 st.subheader("💬 Describe tu melodía")
-user_input = st.text_area(
-    label="Instrucción musical:",
-    placeholder=(
-        "Ej: Una melodía tranquila en Do mayor, tempo lento, 8 compases, "
-        "que suene esperanzadora y fácil de tararear."
-    ),
-    height=120,
-)
 
-generate = st.button("🎼 Generar melodía", type="primary", use_container_width=True)
+tab_text, tab_mic = st.tabs(["✏️ Escribir texto", "🎙️ Grabar con micrófono"])
+
+user_input = ""
+
+with tab_text:
+    user_input_text = st.text_area(
+        label="Instrucción musical:",
+        placeholder=(
+            "Ej: Una melodía tranquila en Do mayor, tempo lento, 8 compases, "
+            "que suene esperanzadora y fácil de tararear."
+        ),
+        height=120,
+    )
+    generate_text = st.button(
+        "🎼 Generar melodía", type="primary", use_container_width=True,
+        key="btn_text",
+    )
+
+with tab_mic:
+    st.markdown(
+        "Presiona el botón del micrófono para grabar tu instrucción musical "
+        "con la voz. Al terminar de hablar, presiona de nuevo para detener."
+    )
+    audio_bytes = audio_recorder(
+        text="Pulsa para grabar",
+        recording_color="#e74c3c",
+        neutral_color="#3498db",
+        icon_size="2x",
+        pause_threshold=2.0,
+        sample_rate=48_000,
+    )
+    components.html(_RECORDING_TIMER_HTML, height=70)
+
+    transcribed_text = ""
+    if audio_bytes:
+        # Mostrar duración final del audio grabado
+        dur = _wav_duration(audio_bytes)
+        mins = int(dur // 60)
+        secs = dur - mins * 60
+        st.metric("⏱ Duración de la grabación", f"{mins}:{secs:04.1f}")
+
+        with st.spinner("🗣️ Transcribiendo audio con Azure Speech…"):
+            try:
+                transcribed_text = transcribe_audio(audio_bytes)
+            except RuntimeError as e:
+                st.error(f"❌ Error al transcribir: {e}")
+
+        if transcribed_text:
+            st.info(f"📝 Texto reconocido: **{transcribed_text}**")
+
+    generate_mic = st.button(
+        "🎼 Generar melodía desde voz", type="primary",
+        use_container_width=True, key="btn_mic",
+        disabled=not transcribed_text,
+    )
+
+# Determinar cuál flujo se activó
+generate = False
+if generate_text:
+    user_input = user_input_text.strip()
+    generate = True
+elif generate_mic and transcribed_text:
+    user_input = transcribed_text
+    generate = True
 
 # ── Procesamiento ─────────────────────────────────────────────────────────────
 if generate:
-    if not user_input.strip():
-        st.warning("⚠️ Por favor escribe una instrucción antes de generar.")
+    if not user_input:
+        st.warning("⚠️ Por favor escribe o dicta una instrucción antes de generar.")
         st.stop()
 
     with st.spinner("🧠 Analizando con Azure AI Foundry…"):
@@ -359,6 +636,20 @@ if generate:
         except Exception as e:
             st.error(f"❌ Error al generar MIDI: {e}")
             st.stop()
+
+    # Sintetizar audio para reproducción en navegador
+    with st.spinner("🔊 Sintetizando audio…"):
+        try:
+            wav_bytes = synthesize_wav(music_data)
+        except Exception as e:
+            wav_bytes = None
+            st.warning(f"⚠️ No se pudo sintetizar audio: {e}")
+
+    st.subheader("▶️ Reproducir melodía")
+    if wav_bytes:
+        st.audio(wav_bytes, format="audio/wav")
+    else:
+        st.info("La reproducción no está disponible. Descarga el MIDI.")
 
     st.subheader("⬇️ Descarga tu MIDI")
     st.download_button(
