@@ -20,3 +20,6 @@ __pycache__/
 # IDEs
 .vscode/
 .idea/
+
+#intrucciones
+intrucciones/
