@@ -9,9 +9,11 @@ import math
 import os
 import re
 import struct
+import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
+import azure.cognitiveservices.speech as speechsdk
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
@@ -48,26 +50,8 @@ PITCH_MIN = 48
 PITCH_MAX = 72
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2a. HELPERS DE AUDIO
+# 2a. TIMER JS DE GRABACIÓN
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _wav_duration(wav_bytes: bytes) -> float:
-    """
-    Extrae la duración en segundos de un buffer WAV/PCM.
-    """
-    try:
-        if len(wav_bytes) < 44:
-            return 0.0
-        channels    = struct.unpack_from("<H", wav_bytes, 22)[0]
-        sample_rate = struct.unpack_from("<I", wav_bytes, 24)[0]
-        bits        = struct.unpack_from("<H", wav_bytes, 34)[0]
-        pcm         = wav_bytes[44:]
-        n_samples   = len(pcm) // (bits // 8)
-        duration    = n_samples / (sample_rate * channels) if sample_rate else 0
-        return round(duration, 1)
-    except Exception:
-        return 0.0
-
 
 # Timer JS que observa el botón del audio_recorder y muestra cronómetro en vivo
 _RECORDING_TIMER_HTML = """
@@ -137,12 +121,12 @@ _RECORDING_TIMER_HTML = """
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2b. TRANSCRIPCIÓN DE VOZ (Azure Speech-to-Text REST API)
+# 2b. TRANSCRIPCIÓN DE VOZ (Azure Speech-to-Text SDK)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def transcribe_audio(audio_bytes: bytes, language: str = "es-CR") -> str:
     """
-    Envía audio WAV a Azure Speech-to-Text REST API y devuelve el texto.
+    Transcribe audio WAV usando el SDK oficial de Azure Speech.
     Lanza RuntimeError si la transcripción falla.
     """
     if not SPEECH_KEY or not SPEECH_REGION:
@@ -150,34 +134,51 @@ def transcribe_audio(audio_bytes: bytes, language: str = "es-CR") -> str:
             "Variables SPEECH_KEY o AZURE_SPEECH_REGION no están configuradas."
         )
 
-    url = (
-        f"https://{SPEECH_REGION}.stt.speech.microsoft.com"
-        f"/speech/recognition/conversation/cognitiveservices/v1"
-        f"?language={language}&format=detailed"
+    # Configurar el reconocedor con las credenciales existentes
+    speech_config = speechsdk.SpeechConfig(
+        subscription=SPEECH_KEY, region=SPEECH_REGION
     )
-    headers = {
-        "Ocp-Apim-Subscription-Key": SPEECH_KEY,
-        "Content-Type": "audio/wav; codecs=audio/pcm; samplerate=48000",
-        "Accept": "application/json",
-    }
-    try:
-        resp = requests.post(url, headers=headers, data=audio_bytes, timeout=30)
-        resp.raise_for_status()
-    except requests.exceptions.HTTPError:
-        raise RuntimeError(
-            f"Error HTTP {resp.status_code} de Speech API: {resp.text[:400]}"
-        )
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Error de conexión con Speech API: {e}")
+    speech_config.speech_recognition_language = language
 
-    result = resp.json()
-    status = result.get("RecognitionStatus", "")
-    if status != "Success":
+    # Escribir los bytes WAV a un archivo temporal para que el SDK
+    # parsee correctamente la cabecera WAV (sample rate, bits, canales).
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    try:
+        tmp.write(audio_bytes)
+        tmp.close()
+
+        audio_config = speechsdk.audio.AudioConfig(filename=tmp.name)
+        recognizer = speechsdk.SpeechRecognizer(
+            speech_config=speech_config, audio_config=audio_config
+        )
+
+        result = recognizer.recognize_once()
+    finally:
+        # Liberar handles del SDK antes de borrar el archivo en Windows
+        del recognizer, audio_config
+        try:
+            os.unlink(tmp.name)
+        except PermissionError:
+            pass  # Windows: el SDK aún retiene el archivo; se limpiará con el SO
+
+    # Manejar los distintos resultados del SDK
+    if result.reason == speechsdk.ResultReason.RecognizedSpeech:
+        return result.text.strip()
+
+    if result.reason == speechsdk.ResultReason.NoMatch:
         raise RuntimeError(
-            f"No se pudo transcribir el audio (status={status}). "
+            "No se detectó voz en el audio. "
             "Intenta hablar más claro o más cerca del micrófono."
         )
-    return result.get("DisplayText", "").strip()
+
+    if result.reason == speechsdk.ResultReason.Canceled:
+        cancellation = result.cancellation_details
+        raise RuntimeError(
+            f"La transcripción fue cancelada: {cancellation.reason}. "
+            f"{cancellation.error_details or 'Verifica tu conexión y credenciales.'}"
+        )
+
+    raise RuntimeError("Resultado inesperado de Azure Speech SDK.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -546,19 +547,25 @@ with tab_mic:
     )
     components.html(_RECORDING_TIMER_HTML, height=70)
 
+    # Cachear transcripción en session_state para no re-ejecutar en cada rerun
+    if "last_audio_hash" not in st.session_state:
+        st.session_state.last_audio_hash = None
+        st.session_state.transcribed_text = ""
+
     transcribed_text = ""
     if audio_bytes:
-        # Mostrar duración final del audio grabado
-        dur = _wav_duration(audio_bytes)
-        mins = int(dur // 60)
-        secs = dur - mins * 60
-        st.metric("⏱ Duración de la grabación", f"{mins}:{secs:04.1f}")
+        audio_hash = hash(audio_bytes)
+        if audio_hash != st.session_state.last_audio_hash:
+            # Audio nuevo → transcribir ahora (al detener la grabación)
+            with st.spinner("🗣️ Transcribiendo audio con Azure Speech…"):
+                try:
+                    st.session_state.transcribed_text = transcribe_audio(audio_bytes)
+                except RuntimeError as e:
+                    st.session_state.transcribed_text = ""
+                    st.error(f"❌ Error al transcribir: {e}")
+            st.session_state.last_audio_hash = audio_hash
 
-        with st.spinner("🗣️ Transcribiendo audio con Azure Speech…"):
-            try:
-                transcribed_text = transcribe_audio(audio_bytes)
-            except RuntimeError as e:
-                st.error(f"❌ Error al transcribir: {e}")
+        transcribed_text = st.session_state.transcribed_text
 
         if transcribed_text:
             st.info(f"📝 Texto reconocido: **{transcribed_text}**")

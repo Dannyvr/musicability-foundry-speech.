@@ -2,3 +2,4 @@ streamlit
 python-dotenv
 requests
 audio-recorder-streamlit
+azure-cognitiveservices-speech
